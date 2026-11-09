@@ -6,27 +6,32 @@ import logging
 import signal
 
 import httpx
+from aio_pika.exceptions import AMQPError
 from faststream import AckPolicy
 from faststream.rabbit import Channel, RabbitBroker
 from faststream.rabbit.annotations import RabbitMessage
 from pamqp.commands import Basic
 from pydantic import ValidationError
 
+from app.application.outbox import OutboxRelay
+from app.application.processing import InvalidWorkMessage, PaymentProcessor
 from app.config import Settings, get_settings
-from app.db import Database
-from app.events import WorkMessage
-from app.messaging.consumer import InvalidWorkMessage, PaymentProcessor
-from app.messaging.outbox import OutboxRelay, PublicationNotConfirmed, RabbitPublisher
+from app.diagnostics import safe_exception_trace
+from app.domain.payment import RetryPolicy
+from app.infrastructure.db.database import Database, DatabaseUnavailable
+from app.infrastructure.gateway import EmulatedGateway
+from app.infrastructure.webhooks import WebhookDestinations, WebhookSender
+from app.messaging.messages import WorkMessage
+from app.messaging.outbox import PublicationNotConfirmed, RabbitPublisher
 from app.messaging.topology import (
     DLX_EXCHANGE,
     PAYMENTS_EXCHANGE,
     PAYMENTS_QUEUE,
     declare_topology,
 )
-from app.services.gateway import EmulatedGateway
-from app.services.webhooks import WebhookSender
 
 logger = logging.getLogger(__name__)
+UNEXPECTED_RECOVERY_DELAY = 10
 
 
 def create_broker(settings: Settings) -> RabbitBroker:
@@ -72,20 +77,25 @@ async def run_connected(
     database: Database,
     client: httpx.AsyncClient,
     stop: asyncio.Event,
-) -> None:
+) -> bool:
     broker = create_broker(settings)
     recovery = asyncio.Event()
+    unexpected_failure = False
     processor = PaymentProcessor(
-        database,
-        settings,
+        database.unit_of_work,
+        RetryPolicy(settings.retry_base_delay),
         EmulatedGateway(settings),
-        WebhookSender(client, settings.webhook_timeout),
+        WebhookSender(
+            client, settings.webhook_timeout, WebhookDestinations(settings.webhook_allowed_origins)
+        ),
     )
 
     @broker.subscriber(
         PAYMENTS_QUEUE, PAYMENTS_EXCHANGE, ack_policy=AckPolicy.MANUAL, no_reply=True
     )
     async def handle(message: RabbitMessage) -> None:
+        nonlocal unexpected_failure
+        event = None
         try:
             try:
                 event = WorkMessage.model_validate_json(message.body)
@@ -95,17 +105,24 @@ async def run_connected(
                 )
                 return
             try:
-                await processor.process(event)
+                await processor.process(event.to_command())
             except InvalidWorkMessage as error:
                 await quarantine(broker, message, str(error), settings.publish_timeout)
                 return
             await message.ack()
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
+        except (DatabaseUnavailable, PublicationNotConfirmed, AMQPError) as error:
             logger.warning("consumer_recovery_required reason=%s", type(error).__name__)
             # Closing the channel requeues this unacked delivery; do not consume
             # its logical retry budget when the DB or connection is unavailable.
+            recovery.set()
+        except Exception as error:
+            logger.error(
+                "consumer_unexpected_failure payment_id=%s event_id=%s %s",
+                event.payment_id if event else None,
+                event.event_id if event else None,
+                safe_exception_trace(error),
+            )
+            unexpected_failure = True
             recovery.set()
 
     tasks: list[asyncio.Task] = []
@@ -113,9 +130,14 @@ async def run_connected(
         await broker.connect()
         await declare_topology(broker)
         await broker.start()
-        relay = OutboxRelay(database, settings, RabbitPublisher(broker, settings.publish_timeout))
+        relay = OutboxRelay(
+            database.unit_of_work,
+            RabbitPublisher(broker, settings.publish_timeout),
+            publish_timeout=settings.publish_timeout,
+            retry_delay=settings.recovery_delay,
+        )
         tasks = [
-            asyncio.create_task(relay.run(), name="outbox-relay"),
+            asyncio.create_task(run_outbox(relay, settings), name="outbox-relay"),
             asyncio.create_task(recovery.wait(), name="consumer-recovery"),
             asyncio.create_task(stop.wait(), name="worker-stop"),
         ]
@@ -123,6 +145,7 @@ async def run_connected(
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             task.result()
+        return unexpected_failure
     finally:
         for task in tasks:
             task.cancel()
@@ -130,8 +153,21 @@ async def run_connected(
         await broker.stop()
 
 
+async def run_outbox(relay: OutboxRelay, settings: Settings) -> None:
+    while True:
+        try:
+            published = await relay.publish_once()
+        except DatabaseUnavailable as error:
+            logger.warning("outbox_database_unavailable reason=%s", type(error).__name__)
+            await asyncio.sleep(settings.recovery_delay)
+            continue
+        if not published:
+            await asyncio.sleep(settings.outbox_poll_interval)
+
+
 async def run_worker(settings: Settings, stop: asyncio.Event | None = None) -> None:
     stop = stop or asyncio.Event()
+    WebhookDestinations(settings.webhook_allowed_origins)
     loop = asyncio.get_running_loop()
     for name in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
@@ -140,15 +176,18 @@ async def run_worker(settings: Settings, stop: asyncio.Event | None = None) -> N
     try:
         async with httpx.AsyncClient(follow_redirects=False, trust_env=False) as client:
             while not stop.is_set():
+                delay = settings.recovery_delay
                 try:
-                    await run_connected(settings, database, client, stop)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as error:
+                    if await run_connected(settings, database, client, stop):
+                        delay = max(delay, UNEXPECTED_RECOVERY_DELAY)
+                except (AMQPError, OSError) as error:
                     logger.warning("worker_connection_failed reason=%s", type(error).__name__)
+                except Exception as error:
+                    logger.error("worker_unexpected_failure %s", safe_exception_trace(error))
+                    delay = max(delay, UNEXPECTED_RECOVERY_DELAY)
                 if not stop.is_set():
                     with contextlib.suppress(TimeoutError):
-                        await asyncio.wait_for(stop.wait(), timeout=settings.recovery_delay)
+                        await asyncio.wait_for(stop.wait(), timeout=delay)
     finally:
         await database.close()
 

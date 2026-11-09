@@ -26,7 +26,7 @@ class Base(DeclarativeBase):
     pass
 
 
-class Payment(Base):
+class PaymentRow(Base):
     __tablename__ = "payments"
     __table_args__ = (
         UniqueConstraint("idempotency_key", name="uq_payments_idempotency_key"),
@@ -67,7 +67,7 @@ class Payment(Base):
     last_error: Mapped[str | None] = mapped_column(String(500))
 
 
-class Outbox(Base):
+class OutboxRow(Base):
     __tablename__ = "outbox"
     __table_args__ = (
         UniqueConstraint(

@@ -2,24 +2,39 @@
 
 import os
 from collections.abc import AsyncIterator
+from pathlib import Path
 from uuid import uuid4
 
 import httpx
 import pytest
 import pytest_asyncio
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.config import Settings
-from app.db import Database
+from app.infrastructure.db.database import Database
 from app.main import create_app
-from app.models import Base
+
+
+def pytest_addoption(parser):
+    parser.addoption("--fail-on-skip", action="store_true", help="Require all tests to run")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if exitstatus == pytest.ExitCode.OK and session.config.getoption("--fail-on-skip"):
+        reporter = session.config.pluginmanager.get_plugin("terminalreporter")
+        if reporter.stats.get("skipped"):
+            reporter.write_line("The full suite must run without skips.", red=True)
+            session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 @pytest.fixture
 def settings() -> Settings:
     return Settings(
         api_key="test-secret",
+        webhook_allowed_origins=("http://receiver.test",),
         retry_base_delay=5,
         gateway_min_delay=0,
         gateway_max_delay=0,
@@ -40,18 +55,19 @@ async def database() -> AsyncIterator[Database]:
 
     schema = f"payments_test_{uuid4().hex}"
     admin_engine = create_async_engine(url)
-    database = Database(url)
-    await database.engine.dispose()
-    database.engine = create_async_engine(
-        url,
-        connect_args={"server_settings": {"search_path": schema}},
-    )
-    database.sessions = async_sessionmaker(database.engine, expire_on_commit=False)
+    database = Database(url, schema=schema)
+
+    def migrate(connection):
+        config = Config(Path(__file__).resolve().parents[1] / "alembic.ini")
+        config.attributes["connection"] = connection
+        command.upgrade(config, "head")
+        command.check(config)
+
     try:
         async with admin_engine.begin() as connection:
             await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
         async with database.engine.begin() as connection:
-            await connection.run_sync(Base.metadata.create_all)
+            await connection.run_sync(migrate)
         yield database
     finally:
         await database.close()

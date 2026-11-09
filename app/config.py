@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     rabbitmq_url: str = "amqp://payments:payments@localhost:5672/"
     retry_base_delay: float = Field(default=5, gt=0)
     webhook_timeout: float = Field(default=10, gt=0)
+    webhook_allowed_origins: tuple[str, ...] = ()
     outbox_poll_interval: float = Field(default=0.5, gt=0)
     publish_timeout: float = Field(default=5, gt=0)
     gateway_min_delay: float = Field(default=2, ge=0)

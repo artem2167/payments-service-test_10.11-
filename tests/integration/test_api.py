@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -6,7 +7,12 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import event, func, select
 
-from app.models import Outbox, Payment
+from app.application.commands import CreatePayment
+from app.application.payments import PaymentService
+from app.domain.payment import Currency
+from app.infrastructure.db.models import OutboxRow as Outbox
+from app.infrastructure.db.models import PaymentRow as Payment
+from app.infrastructure.webhooks import WebhookDestinations
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -213,6 +219,59 @@ async def test_invalid_payment_never_writes_rows(client, database, payment_body,
     assert await counts(database) == (0, 0)
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1/events",
+        "http://169.254.169.254/events",
+        "http://receiver.test:8080/events",
+        "http://receiver.test.evil.test/events",
+        "http://receiver.test@evil.test/events",
+        "http://user@receiver.test/events",
+    ],
+)
+async def test_unlisted_webhook_destination_is_rejected_without_creating_payment(
+    client, database, payment_body, url
+):
+    response = await client.post(
+        "/api/v1/payments",
+        json={**payment_body, "webhook_url": url},
+        headers={"Idempotency-Key": "invalid-destination"},
+    )
+    assert response.status_code == 422
+    assert await counts(database) == (0, 0)
+
+
+async def test_direct_service_call_cannot_store_a_rounded_amount(database):
+    destinations = WebhookDestinations(("http://receiver.test",))
+    service = PaymentService(database.unit_of_work, destinations.require_allowed)
+    command = CreatePayment(
+        Decimal("1.001"), Currency.RUB, "order", {}, "http://receiver.test/events", "key"
+    )
+    with pytest.raises(ValueError, match="whole cents"):
+        await service.create(command)
+    assert await counts(database) == (0, 0)
+
+
+async def test_database_programming_error_returns_500_without_sql(client, database, caplog):
+    def replace_health_query(conn, cursor, statement, parameters, context, executemany):
+        if statement == "SELECT 1":
+            statement = "SELECT private_missing_column"
+        return statement, parameters
+
+    engine = database.engine.sync_engine
+    event.listen(engine, "before_cursor_execute", replace_health_query, retval=True)
+    try:
+        response = await client.get("/health")
+    finally:
+        event.remove(engine, "before_cursor_execute", replace_health_query)
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error"}
+    assert "ProgrammingError" in caplog.text
+    assert "private_missing_column" not in caplog.text
+
+
 async def test_unknown_payment_returns_404(client):
     assert (await client.get(f"/api/v1/payments/{uuid4()}")).status_code == 404
 
@@ -247,6 +306,37 @@ async def test_concurrent_different_requests_have_one_winner(client, database, p
     assert sum(response.status_code == 202 for response in responses) == 1
     assert sum(response.status_code == 409 for response in responses) == 11
     assert await counts(database) == (1, 1)
+
+
+async def test_replay_accepts_fingerprint_from_before_refactor(client, database, payment_body):
+    payment_body["metadata"] = {"order_id": "42", "товар": "чай"}
+    old_canonical = (
+        '{"amount":"1500.00","currency":"RUB","description":"Order 42",'
+        '"metadata":{"order_id":"42","товар":"чай"},'
+        '"webhook_url":"http://receiver.test/events"}'
+    )
+    fingerprint = hashlib.sha256(old_canonical.encode()).hexdigest()
+    payment_id = uuid4()
+    async with database.sessions() as session, session.begin():
+        session.add(
+            Payment(
+                id=payment_id,
+                amount=Decimal("1500.00"),
+                currency="RUB",
+                description="Order 42",
+                metadata_json=payment_body["metadata"],
+                idempotency_key="old-record",
+                request_hash=fingerprint,
+                webhook_url=payment_body["webhook_url"],
+            )
+        )
+
+    replay = await client.post(
+        "/api/v1/payments", json=payment_body, headers={"Idempotency-Key": "old-record"}
+    )
+    assert replay.status_code == 202
+    assert replay.json()["payment_id"] == str(payment_id)
+    assert await counts(database) == (1, 0)
 
 
 async def test_failed_outbox_insert_rolls_back_payment(client, database, payment_body):

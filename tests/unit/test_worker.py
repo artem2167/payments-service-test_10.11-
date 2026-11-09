@@ -5,10 +5,10 @@ from uuid import uuid4
 
 import pytest
 from faststream import AckPolicy
-from sqlalchemy.exc import OperationalError
 
 from app import worker
-from app.events import WorkMessage
+from app.infrastructure.db.database import DatabaseUnavailable
+from app.messaging.messages import WorkMessage
 
 
 class ControlledBroker:
@@ -41,9 +41,11 @@ async def idle_relay():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "database", "invalid_schema", "quarantine_failure"])
+@pytest.mark.parametrize(
+    "failure", [None, "database", "invalid_schema", "quarantine_failure", "unexpected"]
+)
 async def test_worker_acks_only_committed_or_quarantined_work_and_recovers_unacked(
-    settings, monkeypatch, failure
+    settings, monkeypatch, caplog, failure
 ):
     event = WorkMessage(schema_version=1, event_id=uuid4(), payment_id=uuid4(), attempt_no=1)
     body = (
@@ -72,30 +74,38 @@ async def test_worker_acks_only_committed_or_quarantined_work_and_recovers_unack
 
     async def process(event):
         if failure == "database":
-            raise OperationalError("SELECT payments", {}, RuntimeError("offline"))
+            raise DatabaseUnavailable("offline")
+        if failure == "unexpected":
+            raise TypeError("private webhook data")
         journal.append("committed")
 
     processor.process.side_effect = process
     processor_factory = Mock(return_value=processor)
-    relay = SimpleNamespace(run=idle_relay)
     monkeypatch.setattr(worker, "create_broker", lambda settings: broker)
     monkeypatch.setattr(worker, "declare_topology", AsyncMock())
     monkeypatch.setattr(worker, "PaymentProcessor", processor_factory)
-    monkeypatch.setattr(worker, "OutboxRelay", lambda *args: relay)
+    monkeypatch.setattr(worker, "run_outbox", lambda *args: idle_relay())
 
-    await asyncio.wait_for(worker.run_connected(settings, object(), object(), stop), 1)
+    database = SimpleNamespace(unit_of_work=Mock())
+    unexpected = await asyncio.wait_for(worker.run_connected(settings, database, object(), stop), 1)
+    assert unexpected is (failure == "unexpected")
     assert len(broker.subscriptions) == 1
     assert broker.subscriptions[0][1]["ack_policy"] == AckPolicy.MANUAL
     broker.stop.assert_awaited_once()
     if failure is None:
         assert journal == ["committed", "ack"]
-        processor.process.assert_awaited_once_with(event)
+        processor.process.assert_awaited_once_with(event.to_command())
         broker.publish.assert_not_awaited()
-    elif failure == "database":
+    elif failure in {"database", "unexpected"}:
         assert journal == []
         message.ack.assert_not_awaited()
         broker.publish.assert_not_awaited()
         assert not stop.is_set()  # Recovery ended the session independently of shutdown.
+        if failure == "unexpected":
+            assert str(event.payment_id) in caplog.text
+            assert "TypeError" in caplog.text
+            assert "in process" in caplog.text
+            assert "private webhook data" not in caplog.text
     elif failure == "invalid_schema":
         processor.process.assert_not_awaited()
         broker.publish.assert_awaited_once()

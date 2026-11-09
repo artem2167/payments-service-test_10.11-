@@ -1,12 +1,13 @@
+from datetime import UTC, datetime
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
 from pamqp.commands import Basic
 
+from app.application.events import OutboxEvent
 from app.messaging.outbox import PublicationNotConfirmed, RabbitPublisher
 from app.messaging.topology import DLX_EXCHANGE, PAYMENTS_EXCHANGE
-from app.models import Outbox
 
 
 @pytest.mark.asyncio
@@ -14,7 +15,7 @@ from app.models import Outbox
 async def test_missing_or_negative_confirmation_is_not_success(confirmation):
     broker = AsyncMock()
     broker.publish.return_value = confirmation
-    row = Outbox(id=uuid4(), routing_key="payments.new", event_type="payment.process", payload={})
+    row = OutboxEvent(uuid4(), uuid4(), "payment.process", 1, "payments.new", {}, datetime.now(UTC))
     with pytest.raises(PublicationNotConfirmed):
         await RabbitPublisher(broker, timeout=1)(row)
 
@@ -29,8 +30,11 @@ async def test_confirmed_publication_is_persistent_mandatory_and_identified(
 ):
     broker = AsyncMock()
     broker.publish.return_value = confirmation
-    row = Outbox(
+    row = OutboxEvent(
         id=uuid4(),
+        payment_id=uuid4(),
+        attempt_no=1,
+        available_at=datetime.now(UTC),
         routing_key=routing_key,
         event_type="payment.process",
         payload={"schema_version": 1},

@@ -10,15 +10,18 @@ import pytest
 import pytest_asyncio
 from faststream.rabbit import ExchangeType, RabbitExchange, RabbitQueue
 from sqlalchemy import select, update
-from sqlalchemy.exc import OperationalError
 
 from app import worker
-from app.events import WorkMessage
+from app.application.outbox import OutboxRelay
+from app.application.processing import PaymentProcessor
+from app.domain.payment import RetryPolicy
+from app.infrastructure.db.database import DatabaseUnavailable
+from app.infrastructure.db.models import OutboxRow as Outbox
+from app.infrastructure.db.models import PaymentRow as Payment
+from app.infrastructure.webhooks import WebhookDestinations, WebhookSender
 from app.messaging import outbox, topology
-from app.messaging.consumer import PaymentProcessor
-from app.messaging.outbox import OutboxRelay, RabbitPublisher
-from app.models import Outbox, Payment
-from app.services.webhooks import WebhookSender
+from app.messaging.messages import WorkMessage
+from app.messaging.outbox import RabbitPublisher
 from app.worker import create_broker
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
@@ -86,7 +89,12 @@ async def test_real_confirmed_publication_and_consumer_result(
 ):
     broker, queue, _, _ = rabbit
     event = await create_event(client, database, payment_body)
-    relay = OutboxRelay(database, settings, RabbitPublisher(broker, timeout=3))
+    relay = OutboxRelay(
+        database.unit_of_work,
+        RabbitPublisher(broker, timeout=3),
+        publish_timeout=settings.publish_timeout,
+        retry_delay=settings.recovery_delay,
+    )
     assert await relay.publish_once() == 1
     incoming = await queue.get(timeout=3)
     assert incoming.message_id == str(event.id)
@@ -100,10 +108,15 @@ async def test_real_confirmed_publication_and_consumer_result(
 
     gateway = AsyncMock(return_value="succeeded")
     async with httpx.AsyncClient(transport=httpx.MockTransport(receive)) as http:
-        processor = PaymentProcessor(database, settings, gateway, WebhookSender(http, timeout=1))
-        await processor.process(work)
+        processor = PaymentProcessor(
+            database.unit_of_work,
+            RetryPolicy(settings.retry_base_delay),
+            gateway,
+            WebhookSender(http, 1, WebhookDestinations(settings.webhook_allowed_origins)),
+        )
+        await processor.process(work.to_command())
         await incoming.ack()
-        await processor.process(work)
+        await processor.process(work.to_command())
     async with database.sessions() as session:
         payment = await session.get(Payment, event.payment_id)
         stored = await session.get(Outbox, event.id)
@@ -122,7 +135,12 @@ async def test_real_missing_binding_is_not_marked_published_and_recovers(
     broker, queue, _, exchange = rabbit
     event = await create_event(client, database, payment_body)
     await queue.unbind(exchange, routing_key="payments.new")
-    relay = OutboxRelay(database, settings, RabbitPublisher(broker, timeout=3))
+    relay = OutboxRelay(
+        database.unit_of_work,
+        RabbitPublisher(broker, timeout=3),
+        publish_timeout=settings.publish_timeout,
+        retry_delay=settings.recovery_delay,
+    )
     assert await relay.publish_once() == 0
     async with database.sessions() as session:
         pending = await session.get(Outbox, event.id)
@@ -147,7 +165,12 @@ async def test_three_real_deliveries_publish_one_dead_letter(
 ):
     broker, queue, dlq, _ = rabbit
     event = await create_event(client, database, payment_body)
-    relay = OutboxRelay(database, settings, RabbitPublisher(broker, timeout=3))
+    relay = OutboxRelay(
+        database.unit_of_work,
+        RabbitPublisher(broker, timeout=3),
+        publish_timeout=settings.publish_timeout,
+        retry_delay=settings.recovery_delay,
+    )
     gateway = AsyncMock(return_value="succeeded")
     calls = []
 
@@ -168,9 +191,12 @@ async def test_three_real_deliveries_publish_one_dead_letter(
             incoming = await queue.get(timeout=3)
             work = WorkMessage.model_validate_json(incoming.body)
             assert work.attempt_no == attempt
-            await PaymentProcessor(database, settings, gateway, WebhookSender(http, 1)).process(
-                work
-            )
+            await PaymentProcessor(
+                database.unit_of_work,
+                RetryPolicy(settings.retry_base_delay),
+                gateway,
+                WebhookSender(http, 1, WebhookDestinations(settings.webhook_allowed_origins)),
+            ).process(work.to_command())
             await incoming.ack()
     assert await relay.publish_once() == 1
     dead = await dlq.get(timeout=3)
@@ -206,9 +232,7 @@ async def test_real_worker_requeues_unacked_database_failure_then_recovers(
     )
     original_processor = worker.PaymentProcessor
     failing_processor = SimpleNamespace(
-        process=AsyncMock(
-            side_effect=OperationalError("SELECT payments", {}, RuntimeError("database offline"))
-        )
+        process=AsyncMock(side_effect=DatabaseUnavailable("database offline"))
     )
     monkeypatch.setattr(worker, "PaymentProcessor", lambda *args: failing_processor)
     requests = []

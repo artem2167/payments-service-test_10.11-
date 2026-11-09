@@ -48,7 +48,13 @@ services:
       target: test
     init: true
     environment: *test-environment
-    command: ["sh", "-c", "alembic upgrade head && python -m pytest -q -p no:cacheprovider"]
+    command:
+      - sh
+      - -ec
+      - |
+        ruff check --no-cache app migrations tests examples scripts
+        ruff format --no-cache --check app migrations tests examples scripts
+        python -m pytest -q -p no:cacheprovider --fail-on-skip
     depends_on:
       postgres:
         condition: service_healthy

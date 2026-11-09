@@ -1,0 +1,18 @@
+name: Checks
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - name: Run lint and tests with PostgreSQL and RabbitMQ
+        run: docker compose -f compose.test.yaml up --build --abort-on-container-exit --exit-code-from tests tests
+      - name: Remove test services
+        if: always()
+        run: docker compose -f compose.test.yaml down --volumes

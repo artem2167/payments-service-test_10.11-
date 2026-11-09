@@ -1,8 +1,7 @@
 import json
 from datetime import datetime
 from decimal import Decimal
-from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any
 from uuid import UUID
 
 from pydantic import (
@@ -15,18 +14,7 @@ from pydantic import (
     field_validator,
 )
 
-
-class Currency(StrEnum):
-    RUB = "RUB"
-    USD = "USD"
-    EUR = "EUR"
-
-
-class PaymentStatus(StrEnum):
-    PENDING = "pending"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-
+from app.domain.payment import Currency, PaymentStatus
 
 Money = Annotated[Decimal, Field(gt=0, max_digits=18, decimal_places=2, allow_inf_nan=False)]
 
@@ -110,22 +98,6 @@ class PaymentResponse(PaymentAccepted):
     webhook_url: str
     processed_at: datetime | None
     delivery: DeliveryInfo
-
-    @field_serializer("amount")
-    def serialize_amount(self, value: Decimal) -> str:
-        return format(value, ".2f")
-
-
-class WebhookPayload(BaseModel):
-    event_id: UUID
-    event_type: Literal["payment.completed"] = "payment.completed"
-    payment_id: UUID
-    status: PaymentStatus
-    amount: Decimal
-    currency: Currency
-    metadata: dict[str, Any]
-    created_at: datetime
-    processed_at: datetime
 
     @field_serializer("amount")
     def serialize_amount(self, value: Decimal) -> str:

@@ -6,8 +6,10 @@ import pytest
 from sqlalchemy import event, select, update
 from sqlalchemy.orm import Session
 
-from app.messaging.outbox import OutboxRelay
-from app.models import Outbox, Payment
+from app.application.outbox import OutboxRelay
+from app.application.ports import PublicationError
+from app.infrastructure.db.models import OutboxRow as Outbox
+from app.infrastructure.db.models import PaymentRow as Payment
 
 pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
 
@@ -30,13 +32,18 @@ async def test_failed_confirm_or_unroutable_message_stays_in_outbox_then_recover
     client, database, settings, payment_body
 ):
     row = await create_outbox(client, database, payment_body)
-    publisher = AsyncMock(side_effect=RuntimeError("unroutable message"))
-    relay = OutboxRelay(database, settings, publisher)
+    publisher = AsyncMock(side_effect=PublicationError("unroutable message"))
+    relay = OutboxRelay(
+        database.unit_of_work,
+        publisher,
+        publish_timeout=settings.publish_timeout,
+        retry_delay=settings.recovery_delay,
+    )
     assert await relay.publish_once() == 0
     failed = await read_outbox(database, row.id)
     assert failed.published_at is None
     assert failed.publish_attempts == 1
-    assert failed.last_error == "RuntimeError"
+    assert failed.last_error == "PublicationError"
     assert failed.available_at > row.available_at
 
     async with database.sessions() as session, session.begin():
@@ -69,7 +76,12 @@ async def test_published_timestamp_is_written_only_after_publisher_confirmation(
         publishing.set()
         await confirmation.wait()
 
-    relay = OutboxRelay(database, settings, publisher)
+    relay = OutboxRelay(
+        database.unit_of_work,
+        publisher,
+        publish_timeout=settings.publish_timeout,
+        retry_delay=settings.recovery_delay,
+    )
     task = asyncio.create_task(relay.publish_once())
     try:
         await asyncio.wait_for(publishing.wait(), timeout=3)
@@ -94,10 +106,25 @@ async def test_parallel_relays_do_not_publish_the_same_locked_row(
         started.set()
         await release.wait()
 
-    first = asyncio.create_task(OutboxRelay(database, settings, publisher).publish_once())
+    first = asyncio.create_task(
+        OutboxRelay(
+            database.unit_of_work,
+            publisher,
+            publish_timeout=settings.publish_timeout,
+            retry_delay=settings.recovery_delay,
+        ).publish_once()
+    )
     try:
         await asyncio.wait_for(started.wait(), 3)
-        assert await OutboxRelay(database, settings, publisher).publish_once() == 0
+        assert (
+            await OutboxRelay(
+                database.unit_of_work,
+                publisher,
+                publish_timeout=settings.publish_timeout,
+                retry_delay=settings.recovery_delay,
+            ).publish_once()
+            == 0
+        )
     finally:
         release.set()
         assert await first == 1
@@ -113,7 +140,15 @@ async def test_future_retry_event_is_not_published_early(client, database, setti
             .values(available_at=datetime.now(UTC) + timedelta(minutes=1))
         )
     publisher = AsyncMock()
-    assert await OutboxRelay(database, settings, publisher).publish_once() == 0
+    assert (
+        await OutboxRelay(
+            database.unit_of_work,
+            publisher,
+            publish_timeout=settings.publish_timeout,
+            retry_delay=settings.recovery_delay,
+        ).publish_once()
+        == 0
+    )
     publisher.assert_not_awaited()
 
 
@@ -127,7 +162,12 @@ async def test_failure_after_confirm_before_commit_keeps_event_for_redelivery(
         confirmed_ids.append(row.id)
 
     publisher = AsyncMock(side_effect=confirm)
-    relay = OutboxRelay(database, settings, publisher)
+    relay = OutboxRelay(
+        database.unit_of_work,
+        publisher,
+        publish_timeout=settings.publish_timeout,
+        retry_delay=settings.recovery_delay,
+    )
 
     def interrupt_commit(session):
         if any(

@@ -2,7 +2,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from app.services.gateway import EmulatedGateway
+from app.infrastructure.gateway import EmulatedGateway
 
 
 @pytest.mark.asyncio
@@ -17,9 +17,9 @@ async def test_gateway_probability_boundary_and_nonblocking_delay(
     settings.gateway_max_delay = 5
     choose_delay = Mock(return_value=3.25)
     sleep = AsyncMock()
-    monkeypatch.setattr("app.services.gateway.random.uniform", choose_delay)
-    monkeypatch.setattr("app.services.gateway.random.random", lambda: random_value)
-    monkeypatch.setattr("app.services.gateway.asyncio.sleep", sleep)
+    monkeypatch.setattr("app.infrastructure.gateway.random.uniform", choose_delay)
+    monkeypatch.setattr("app.infrastructure.gateway.random.random", lambda: random_value)
+    monkeypatch.setattr("app.infrastructure.gateway.asyncio.sleep", sleep)
     assert await EmulatedGateway(settings)() == expected
     choose_delay.assert_called_once_with(2, 5)
     sleep.assert_awaited_once_with(3.25)

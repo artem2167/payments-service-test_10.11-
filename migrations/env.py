@@ -6,10 +6,11 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from app.models import Base
+from app.infrastructure.db.models import Base
 
 config = context.config
-if config.config_file_name is not None:
+connection = config.attributes.get("connection")
+if config.config_file_name is not None and connection is None:
     fileConfig(config.config_file_name)
 target_metadata = Base.metadata
 
@@ -49,5 +50,7 @@ async def run_async_migrations() -> None:
 
 if context.is_offline_mode():
     run_migrations_offline()
+elif connection is not None:
+    apply_migrations(connection)
 else:
     asyncio.run(run_async_migrations())

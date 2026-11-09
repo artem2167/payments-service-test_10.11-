@@ -1,4 +1,3 @@
-from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import httpx
@@ -8,16 +7,11 @@ from app.main import create_app
 
 
 class UnusedDatabase:
-    def sessions(self):
+    def unit_of_work(self):
         raise AssertionError("Rejected requests must not start a database operation")
 
-
-class ValidationDatabase:
-    @asynccontextmanager
-    async def sessions(self):
-        # FastAPI may resolve the session dependency before body validation ends.
-        # A session is allowed, while executing domain logic would fail this test.
-        yield object()
+    async def ping(self):
+        raise AssertionError("Unauthorized health checks must not contact the database")
 
 
 def raw_body(amount='"1.00"', metadata="{}", description='"ok"'):
@@ -33,7 +27,7 @@ def raw_body(amount='"1.00"', metadata="{}", description='"ok"'):
 
 
 async def reject_body(settings, payload):
-    app = create_app(settings=settings, database=ValidationDatabase())
+    app = create_app(settings=settings, database=UnusedDatabase())
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app),
         base_url="http://test",

@@ -15,6 +15,7 @@ def main() -> None:
         for name in (
             "README.md",
             "VERIFICATION.md",
+            "AUDIT_COMPLIANCE.md",
             "pyproject.toml",
             "uv.lock",
             "Dockerfile",
@@ -24,6 +25,7 @@ def main() -> None:
             ".env.example",
             ".gitignore",
             ".dockerignore",
+            ".github/workflows/checks.yml",
         )
     ]
     for folder in ("app", "migrations", "tests", "examples", "scripts"):

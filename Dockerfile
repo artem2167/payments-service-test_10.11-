@@ -27,6 +27,7 @@ FROM base AS test
 USER root
 RUN uv sync --frozen
 COPY tests ./tests
+COPY scripts ./scripts
 USER app
 CMD ["pytest", "-q", "-p", "no:cacheprovider"]
 
